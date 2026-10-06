@@ -5,6 +5,9 @@
 - 轮换 = 凭「当前刷新凭证 + 稳定轮换标识」换取唯一后继凭证，代次 +1。
 - 幂等：相同（旧凭证, 轮换标识）重传 —— 包括服务重启后的重试 ——
   返回与首次完全一致的后继凭证与代次，结果标记为 replayed，代次不再推进。
+  幂等键为 (family_id, old_credential_hash, rotation_id)：轮换标识只在发起
+  该请求的授权族及其旧凭证范围内代表一次稳定操作；不同终端（授权族）即使
+  碰巧使用同一轮换标识，也各自形成独立的首次轮换结果，互不影响。
 - 重用检测：已轮换的旧凭证搭配「不同」轮换标识再次出现，
   整个授权族立即撤销并记录原因；此前签发的后继凭证随之被拒绝。
 """
@@ -179,17 +182,8 @@ def _accept_rotation(db, family, terminal_id, cred, cred_hash, rotation_id):
                            cred_hash, new_credential, _hash(new_credential),
                            new_generation, now)
     except sqlite3.IntegrityError:
-        existing = db.find_rotation_by_rotation_id(rotation_id)
-        if existing:
-            return {
-                "outcome": "replayed",
-                "family_id": family["family_id"],
-                "terminal_id": terminal_id,
-                "credential": existing["new_credential"],
-                "generation": existing["new_generation"],
-                "family_status": family["status"],
-                "rotation_id": rotation_id,
-            }
+        # 幂等键 (family_id, old_credential_hash, rotation_id) 兜底：同一轮换已被
+        # 其它进程提交。整体回滚本次半截写入，重试时经幂等重放路径返回首次结果。
         raise ConcurrentRotation()
     db.set_family_generation(family["family_id"], new_generation)
     return {
