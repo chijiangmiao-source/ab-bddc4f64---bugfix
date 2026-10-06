@@ -30,15 +30,24 @@ CREATE TABLE IF NOT EXISTS rotations (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     family_id           TEXT NOT NULL REFERENCES families(family_id),
     terminal_id         TEXT NOT NULL,
-    rotation_id         TEXT NOT NULL,                -- 客户端提供的稳定轮换标识（幂等键）
+    rotation_id         TEXT NOT NULL,                -- 客户端提供的稳定轮换标识（仅在同一授权族内幂等）
     old_credential_hash TEXT NOT NULL,
     new_credential      TEXT NOT NULL,                -- 后继凭证明文：重放时必须原样取回
     new_credential_hash TEXT NOT NULL,
     new_generation      INTEGER NOT NULL,
     created_at          TEXT NOT NULL,
-    UNIQUE (rotation_id)                                  -- 幂等约束
+    -- 轮换标识只在「发起它的终端 / 旧凭证」范围内代表一次稳定操作；
+    -- 不同授权族（乃至不同旧凭证）碰巧使用相同标识必须互不影响。
+    UNIQUE (family_id, old_credential_hash, rotation_id)
 );
 """
+
+_ROTATION_COLUMNS = (
+    "id, family_id, terminal_id, rotation_id, old_credential_hash, "
+    "new_credential, new_credential_hash, new_generation, created_at"
+)
+
+_SCOPED_INDEX = "ux_rotations_family_oldcred_rotation"
 
 
 class Storage:
@@ -54,6 +63,81 @@ class Storage:
             self._conn.execute("PRAGMA busy_timeout=5000")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            self._migrate_rotations_scope()
+            self._heal_corrupted_families()
+
+    def _migrate_rotations_scope(self):
+        """旧库 rotations 为全局 UNIQUE(rotation_id)：重建为族内范围唯一。
+
+        旧约束会令不同授权族的同标识轮换互相误伤；已落库的轮换记录本身有效，
+        只重建唯一约束范围，不改变任何既有轮换结果。
+        """
+        table_sql = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='rotations'"
+        ).fetchone()
+        if table_sql and "UNIQUE (family_id, old_credential_hash, rotation_id)" in table_sql["sql"]:
+            return
+        index = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
+            (_SCOPED_INDEX,),
+        ).fetchone()
+        if index:
+            return  # 已迁移过（CTAS 重建的表 + 范围唯一索引）
+        self._conn.executescript(
+            "ALTER TABLE rotations RENAME TO rotations_legacy;\n"
+            f"CREATE TABLE rotations AS SELECT {_ROTATION_COLUMNS} FROM rotations_legacy;\n"
+            "DROP TABLE rotations_legacy;"
+        )
+        # CTAS 不携带约束，补上正确的范围唯一约束。
+        self._conn.execute(
+            f"CREATE UNIQUE INDEX {_SCOPED_INDEX} "
+            "ON rotations(family_id, old_credential_hash, rotation_id)"
+        )
+
+    def _heal_corrupted_families(self):
+        """收敛旧版本「跨终端同标识碰撞」造成的半提交/误撤销状态。
+
+        旧版本在全局唯一约束上撞车时会提交半成品：本终端旧凭证被置为 rotated、
+        插入了孤立 current 凭证，却没有写入轮换记录；随后重传还会被误判为凭证
+        重用而撤销整个授权族。这里仅处理「没有任何轮换记录」的授权族 —— 正常
+        完成过轮换的终端与真正因重用被撤销的授权族都不在范围内，绝不改动：
+
+          1. 清除误判的撤销状态与原因；
+          2. 删除半提交插入、且无轮换记录指向的孤立 current 凭证；
+          3. 把被误置为 rotated 的凭证恢复为 current；
+          4. family 代次重算为现存凭证的真实代次。
+
+        修复后终端可凭原旧凭证 + 原标识正常完成首次轮换。
+        """
+        family_ids = [
+            r["family_id"]
+            for r in self._conn.execute(
+                "SELECT family_id FROM families f WHERE NOT EXISTS ("
+                "  SELECT 1 FROM rotations r WHERE r.family_id = f.family_id)"
+            ).fetchall()
+        ]
+        for family_id in family_ids:
+            # 零轮换记录的授权族不可能真正触发过重用撤销（撤销必先有轮换），
+            # 因此 revoked 必定是误判；半成品凭证也只可能是碰撞后的半提交产物。
+            self._conn.execute(
+                "UPDATE families SET status='active', revocation_reason=NULL"
+                " WHERE family_id=? AND status='revoked'",
+                (family_id,),
+            )
+            # 删除半提交插入的高代次孤立凭证，只保留最低代次的原始旧凭证。
+            self._conn.execute(
+                "DELETE FROM credentials WHERE family_id=? AND generation > ("
+                "  SELECT COALESCE(MIN(generation), 1) FROM credentials WHERE family_id=?)",
+                (family_id, family_id),
+            )
+            # 原始旧凭证可能被误置为 rotated/revoked，恢复为 current。
+            self._conn.execute(
+                "UPDATE credentials SET status='current' WHERE family_id=?",
+                (family_id,),
+            )
+            self._conn.execute(
+                "UPDATE families SET generation=1 WHERE family_id=?", (family_id,)
+            )
 
     def close(self):
         with self._lock:
@@ -152,9 +236,11 @@ class Storage:
         ).fetchone()
         return dict(row) if row else None
 
-    def find_rotation_by_rotation_id(self, rotation_id):
+    def find_rotation(self, family_id, rotation_id):
+        """按 (授权族, 轮换标识) 找回首次轮换结果 —— 标识只在族内幂等。"""
         row = self._conn.execute(
-            "SELECT * FROM rotations WHERE rotation_id = ?", (rotation_id,)
+            "SELECT * FROM rotations WHERE family_id = ? AND rotation_id = ?",
+            (family_id, rotation_id),
         ).fetchone()
         return dict(row) if row else None
 
